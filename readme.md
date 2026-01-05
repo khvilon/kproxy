@@ -27,12 +27,12 @@
 apk add --no-cache git
 
 # 1) клонировать репозиторий
-git clone <URL_РЕПОЗИТОРИЯ> kproxy
+git clone https://github.com/khvilon/kproxy.git
 cd kproxy
 
 # 2) создать routes.txt из шаблона и поправить под себя
 cp routes_example.txt routes.txt
-vi routes.txt  # или nano
+nano routes.txt  # или vi
 
 # 3) применить маршруты (генерация haproxy.cfg + restart haproxy)
 chmod +x ./setup-haproxy-sni.sh
