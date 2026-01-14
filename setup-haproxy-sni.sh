@@ -93,41 +93,23 @@ generate_haproxy_cfg() {
       echo "  option tcplog"
       echo "  tcp-request inspect-delay 5s"
 
-      # Allow both TLS ClientHello and (for port 443) plaintext HTTP probes (AIO domaincheck does http://<domain>:443)
       if [ "$p" = "443" ]; then
-        echo "  acl is_http payload(0,3)  -m str GET"
-        echo "  acl is_http payload(0,4)  -m str POST"
-        echo "  acl is_http payload(0,4)  -m str HEAD"
-        echo "  acl is_http payload(0,7)  -m str OPTIONS"
+        # Nextcloud AIO domaincheck делает plaintext HTTP на :443 (http://<domain>:443)
+        # Поэтому на 443 принимаем как TLS ClientHello, так и HTTP-методы.
+        echo "  acl is_http payload(0,3) -m str GET"
+        echo "  acl is_http payload(0,4) -m str POST"
+        echo "  acl is_http payload(0,4) -m str HEAD"
+        echo "  acl is_http payload(0,7) -m str OPTIONS"
         echo "  tcp-request content accept if { req_ssl_hello_type 1 } || is_http"
+        echo ""
+        # ВАЖНО: любой plaintext HTTP на 443 отправляем на kdrive:443 (domaincheck/lighttpd с токеном)
+        echo "  use_backend bk_plain_http_443 if is_http"
         echo ""
       else
         echo "  tcp-request content accept if { req_ssl_hello_type 1 }"
         echo ""
       fi
 
-      # --- Plain HTTP on :443 routing by Host header (only when request is plaintext HTTP) ---
-      if [ "$p" = "443" ]; then
-        idx=0
-        awk -v port="$p" '
-          /^[[:space:]]*#/ {next}
-          NF==0 {next}
-          $1=="tls" && $2==port {print $0}
-        ' "$ROUTES_FILE" | while IFS= read -r row; do
-          # shellcheck disable=SC2086
-          set -- $row
-          proto="$1"; listen_port="$2"; host="$3"; backend_ip="$4"; backend_port="$5"
-          idx=$((idx+1))
-          bk="bk_plain_${listen_port}_${idx}"
-          acl="host_plain_${listen_port}_${idx}"
-          # Match Host header case-insensitively within first 512 bytes (enough for normal HTTP headers)
-          echo "  acl $acl payload(0,512) -m sub -i \"Host: $host\""
-          echo "  use_backend $bk if is_http $acl"
-        done
-        echo ""
-      fi
-
-      # --- TLS SNI routing (normal path) ---
       idx=0
       awk -v port="$p" '
         /^[[:space:]]*#/ {next}
@@ -146,28 +128,15 @@ generate_haproxy_cfg() {
       echo "  default_backend bk_tls_${p}_default"
       echo ""
 
-      # --- Backends for plaintext HTTP on :443 (to same targets as tls routes) ---
+      # backend для plaintext HTTP на :443 (AIO domaincheck)
       if [ "$p" = "443" ]; then
-        idx=0
-        awk -v port="$p" '
-          /^[[:space:]]*#/ {next}
-          NF==0 {next}
-          $1=="tls" && $2==port {print $0}
-        ' "$ROUTES_FILE" | while IFS= read -r row; do
-          # shellcheck disable=SC2086
-          set -- $row
-          proto="$1"; listen_port="$2"; host="$3"; backend_ip="$4"; backend_port="$5"
-          idx=$((idx+1))
-          bk="bk_plain_${listen_port}_${idx}"
-          echo "backend $bk"
-          echo "  mode tcp"
-          echo "  option tcp-check"
-          echo "  server s1 ${backend_ip}:${backend_port} check"
-          echo ""
-        done
+        echo "backend bk_plain_http_443"
+        echo "  mode tcp"
+        echo "  option tcp-check"
+        echo "  server s1 192.168.1.55:443 check"
+        echo ""
       fi
 
-      # --- Backends for TLS routes ---
       idx=0
       awk -v port="$p" '
         /^[[:space:]]*#/ {next}
@@ -188,7 +157,7 @@ generate_haproxy_cfg() {
 
       echo "backend bk_tls_${p}_default"
       echo "  mode tcp"
-      echo "  # blackhole для неизвестного SNI/Host: чтобы случайно не проксировать на первый сервис"
+      echo "  # blackhole для неизвестного SNI: чтобы случайно не проксировать на первый сервис"
       echo "  server s1 127.0.0.1:1 check"
       echo ""
     done
@@ -208,7 +177,6 @@ generate_haproxy_cfg() {
       echo "  option forwardfor"
       echo ""
 
-      # ACL + use_backend
       idx=0
       awk -v port="$p" '
         /^[[:space:]]*#/ {next}
@@ -221,7 +189,6 @@ generate_haproxy_cfg() {
         idx=$((idx+1))
         bk="bk_http_${listen_port}_${idx}"
         acl="host_${listen_port}_${idx}"
-        # hdr(host) может содержать :port; матчим и host, и host:port
         echo "  acl $acl hdr(host) -i $host ${host}:${listen_port}"
         echo "  use_backend $bk if $acl"
       done
@@ -230,7 +197,6 @@ generate_haproxy_cfg() {
       echo "  default_backend bk_http_${p}_default"
       echo ""
 
-      # Backends
       idx=0
       awk -v port="$p" '
         /^[[:space:]]*#/ {next}
@@ -281,8 +247,8 @@ post_check() {
   echo "  HTTP: curl -v http://<IP_CT>/ -H 'Host: api.example.com'"
   echo "  TLS : openssl s_client -connect <IP_CT>:443 -servername git.example.com -brief"
   echo ""
-  echo "AIO domaincheck helper (plaintext HTTP on :443):"
-  echo "  printf 'GET / HTTP/1.1\\r\\nHost: cloud.khvilon.ru\\r\\n\\r\\n' | nc -v <PUBLIC_IP> 443"
+  echo "AIO domaincheck (plaintext HTTP on :443):"
+  echo "  printf 'GET / HTTP/1.1\\r\\nHost: cloud.khvilon.ru\\r\\n\\r\\n' | nc -w 4 -v <PUBLIC_IP> 443 | head"
 }
 
 need_root
