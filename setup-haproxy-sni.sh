@@ -92,9 +92,42 @@ generate_haproxy_cfg() {
       echo "  mode tcp"
       echo "  option tcplog"
       echo "  tcp-request inspect-delay 5s"
-      echo "  tcp-request content accept if { req_ssl_hello_type 1 }"
-      echo ""
 
+      # Allow both TLS ClientHello and (for port 443) plaintext HTTP probes (AIO domaincheck does http://<domain>:443)
+      if [ "$p" = "443" ]; then
+        echo "  acl is_http payload(0,3)  -m str GET"
+        echo "  acl is_http payload(0,4)  -m str POST"
+        echo "  acl is_http payload(0,4)  -m str HEAD"
+        echo "  acl is_http payload(0,7)  -m str OPTIONS"
+        echo "  tcp-request content accept if { req_ssl_hello_type 1 } || is_http"
+        echo ""
+      else
+        echo "  tcp-request content accept if { req_ssl_hello_type 1 }"
+        echo ""
+      fi
+
+      # --- Plain HTTP on :443 routing by Host header (only when request is plaintext HTTP) ---
+      if [ "$p" = "443" ]; then
+        idx=0
+        awk -v port="$p" '
+          /^[[:space:]]*#/ {next}
+          NF==0 {next}
+          $1=="tls" && $2==port {print $0}
+        ' "$ROUTES_FILE" | while IFS= read -r row; do
+          # shellcheck disable=SC2086
+          set -- $row
+          proto="$1"; listen_port="$2"; host="$3"; backend_ip="$4"; backend_port="$5"
+          idx=$((idx+1))
+          bk="bk_plain_${listen_port}_${idx}"
+          acl="host_plain_${listen_port}_${idx}"
+          # Match Host header case-insensitively within first 512 bytes (enough for normal HTTP headers)
+          echo "  acl $acl payload(0,512) -m sub -i \"Host: $host\""
+          echo "  use_backend $bk if is_http $acl"
+        done
+        echo ""
+      fi
+
+      # --- TLS SNI routing (normal path) ---
       idx=0
       awk -v port="$p" '
         /^[[:space:]]*#/ {next}
@@ -113,6 +146,28 @@ generate_haproxy_cfg() {
       echo "  default_backend bk_tls_${p}_default"
       echo ""
 
+      # --- Backends for plaintext HTTP on :443 (to same targets as tls routes) ---
+      if [ "$p" = "443" ]; then
+        idx=0
+        awk -v port="$p" '
+          /^[[:space:]]*#/ {next}
+          NF==0 {next}
+          $1=="tls" && $2==port {print $0}
+        ' "$ROUTES_FILE" | while IFS= read -r row; do
+          # shellcheck disable=SC2086
+          set -- $row
+          proto="$1"; listen_port="$2"; host="$3"; backend_ip="$4"; backend_port="$5"
+          idx=$((idx+1))
+          bk="bk_plain_${listen_port}_${idx}"
+          echo "backend $bk"
+          echo "  mode tcp"
+          echo "  option tcp-check"
+          echo "  server s1 ${backend_ip}:${backend_port} check"
+          echo ""
+        done
+      fi
+
+      # --- Backends for TLS routes ---
       idx=0
       awk -v port="$p" '
         /^[[:space:]]*#/ {next}
@@ -133,7 +188,7 @@ generate_haproxy_cfg() {
 
       echo "backend bk_tls_${p}_default"
       echo "  mode tcp"
-      echo "  # blackhole для неизвестного SNI: чтобы случайно не проксировать на первый сервис"
+      echo "  # blackhole для неизвестного SNI/Host: чтобы случайно не проксировать на первый сервис"
       echo "  server s1 127.0.0.1:1 check"
       echo ""
     done
@@ -225,6 +280,9 @@ post_check() {
   echo "Примеры теста:"
   echo "  HTTP: curl -v http://<IP_CT>/ -H 'Host: api.example.com'"
   echo "  TLS : openssl s_client -connect <IP_CT>:443 -servername git.example.com -brief"
+  echo ""
+  echo "AIO domaincheck helper (plaintext HTTP on :443):"
+  echo "  printf 'GET / HTTP/1.1\\r\\nHost: cloud.khvilon.ru\\r\\n\\r\\n' | nc -v <PUBLIC_IP> 443"
 }
 
 need_root
